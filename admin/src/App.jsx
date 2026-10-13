@@ -12,7 +12,7 @@ import { ToastContainer } from 'react-toastify';
 import 'react-toastify/dist/ReactToastify.css';
 import { ThemeProvider, useTheme } from './context/ThemeContext';
 
-export const backEndURL = import.meta.env.VITE_BACKEND_URL;
+export const backEndURL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8787';
 export const currency = '₹';
 
 const AppContent = ({ token, setToken }) => {

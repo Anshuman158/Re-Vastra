@@ -1,426 +1,398 @@
-import { Hono } from 'hono';
-import { generateId, createToken, authUser, adminAuth, checkBanned, hashPassword, verifyPassword, rateLimit, sanitizeError, sanitizeInput } from '../middleware/auth.js';
+import express from 'express';
+import User from '../models/User.js';
+import {
+    createToken,
+    createAdminToken,
+    authUser,
+    adminAuth,
+    checkBanned,
+    hashPassword,
+    verifyPassword,
+    isValidEmail,
+    sanitizeInput,
+    sanitizeError
+} from '../middleware/auth.js';
 
-const app = new Hono();
-
-// Validate email format
-function isValidEmail(email) {
-    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-}
-
-// Format user object for frontend (camelCase compatibility)
-function formatUser(user) {
-    return {
-        ...user,
-        _id: user.id,
-        isSeller: user.is_seller === 1 || user.is_seller === true,
-        isBanned: user.is_banned === 1 || user.is_banned === true,
-        sellerProfile: user.seller_profile,
-        cartData: user.cart_data,
-        banReason: user.ban_reason,
-        createdAt: user.created_at,
-        is_seller: user.is_seller,
-        seller_profile: user.seller_profile,
-        cart_data: user.cart_data
-    };
-}
+const router = express.Router();
 
 // ── Register ───────────────────────────────────────────────────────
-app.post('/register', rateLimit('register', 5), async (c) => {
+router.post('/register', async (req, res) => {
     try {
-        let { name, email, password } = await c.req.json();
+        let { name, email, password } = req.body;
 
-        // Input sanitization
         name = sanitizeInput(name);
         email = sanitizeInput(email)?.toLowerCase();
 
         if (!name || !email || !password) {
-            return c.json({ success: false, message: 'All fields are required' }, 400);
+            return res.status(400).json({ success: false, message: 'All fields are required' });
         }
 
         if (name.length > 100) {
-            return c.json({ success: false, message: 'Name is too long' }, 400);
+            return res.status(400).json({ success: false, message: 'Name is too long' });
         }
 
         if (!isValidEmail(email)) {
-            return c.json({ success: false, message: 'Please enter a valid email' }, 400);
+            return res.status(400).json({ success: false, message: 'Please enter a valid email' });
         }
 
         if (password.length < 8) {
-            return c.json({ success: false, message: 'Password must be at least 8 characters' }, 400);
+            return res.status(400).json({ success: false, message: 'Password must be at least 8 characters' });
         }
 
         if (password.length > 128) {
-            return c.json({ success: false, message: 'Password is too long' }, 400);
+            return res.status(400).json({ success: false, message: 'Password is too long' });
         }
 
-        // Check if user exists
-        const existing = await c.env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
+        // Check if user already exists
+        const existing = await User.findOne({ email });
         if (existing) {
-            return c.json({ success: false, message: 'User already exists' }, 400);
+            return res.status(400).json({ success: false, message: 'User already exists' });
         }
 
-        const id = generateId();
         const hashedPassword = await hashPassword(password);
-        const sellerProfile = JSON.stringify({
-            shopName: "", shopDescription: "", bankingInfo: {}, address: {},
-            isVerified: false, verificationDate: null, totalRentals: 0,
-            avgResponseTime: 0, memberSince: new Date().toISOString(),
-            rating: { average: 0, count: 0 }
+
+        const newUser = await User.create({
+            name,
+            email,
+            password: hashedPassword,
+            sellerProfile: {
+                shopName: '',
+                shopDescription: '',
+                bankingInfo: {},
+                address: {},
+                isVerified: false,
+                verificationDate: null,
+                totalRentals: 0,
+                avgResponseTime: 0,
+                memberSince: new Date(),
+                rating: { average: 0, count: 0 }
+            }
         });
 
-        await c.env.DB.prepare(
-            `INSERT INTO users (id, name, email, password, seller_profile) VALUES (?, ?, ?, ?, ?)`
-        ).bind(id, name, email, hashedPassword, sellerProfile).run();
+        const token = createToken(newUser._id);
 
-        const token = await createToken(id, c.env.JWT_SECRET);
-        const user = formatUser({ id, name, email, is_seller: 0, seller_profile: JSON.parse(sellerProfile), cart_data: {} });
-
-        return c.json({ success: true, token, user });
+        return res.json({ success: true, token, user: newUser.toClientJSON() });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── Login ──────────────────────────────────────────────────────────
-app.post('/login', rateLimit('login', 10), async (c) => {
+router.post('/login', async (req, res) => {
     try {
-        const { email, password } = await c.req.json();
+        const { email, password } = req.body;
 
         if (!email || !password) {
-            return c.json({ success: false, message: 'Email and password are required' }, 400);
+            return res.status(400).json({ success: false, message: 'Email and password are required' });
         }
 
-        const user = await c.env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email?.toLowerCase()).first();
+        const user = await User.findOne({ email: email.toLowerCase() });
         if (!user) {
-            return c.json({ success: false, message: 'Invalid email or password.' }, 400);
+            return res.status(400).json({ success: false, message: 'Invalid email or password.' });
         }
 
-        // Block banned users at login
-        if (user.is_banned === 1) {
-            return c.json({
+        // Block banned users
+        if (user.isBanned) {
+            return res.status(403).json({
                 success: false,
-                message: `Your account has been suspended.${user.ban_reason ? ' Reason: ' + user.ban_reason : ''}`
-            }, 403);
+                message: `Your account has been suspended.${user.banReason ? ' Reason: ' + user.banReason : ''}`
+            });
         }
 
         const { valid, needsUpgrade } = await verifyPassword(password, user.password);
         if (!valid) {
-            return c.json({ success: false, message: 'Invalid email or password.' }, 400);
+            return res.status(400).json({ success: false, message: 'Invalid email or password.' });
         }
 
-        // Migrate legacy SHA-256 hash to PBKDF2 on successful login
+        // Transparently upgrade legacy hash to bcrypt
         if (needsUpgrade) {
-            const newHash = await hashPassword(password);
-            await c.env.DB.prepare('UPDATE users SET password = ? WHERE id = ?').bind(newHash, user.id).run();
+            user.password = await hashPassword(password);
+            await user.save();
         }
 
-        const token = await createToken(user.id, c.env.JWT_SECRET);
-        delete user.password;
-        user.seller_profile = JSON.parse(user.seller_profile || '{}');
-        user.address = JSON.parse(user.address || '{}');
-        user.cart_data = JSON.parse(user.cart_data || '{}');
+        const token = createToken(user._id);
 
-        return c.json({ success: true, token, user: formatUser(user) });
+        return res.json({ success: true, token, user: user.toClientJSON() });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── Google OAuth Login ─────────────────────────────────────────────
-app.post('/google-login', rateLimit('google-login', 10), async (c) => {
+router.post('/google-login', async (req, res) => {
     try {
-        const { credential } = await c.req.json();
+        const { credential } = req.body;
         if (!credential) {
-            return c.json({ success: false, message: 'Google credential is required' }, 400);
+            return res.status(400).json({ success: false, message: 'Google credential is required' });
         }
 
-        // Verify the Google ID token via Google's tokeninfo endpoint
         const googleRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${credential}`);
         if (!googleRes.ok) {
-            return c.json({ success: false, message: 'Invalid Google token' }, 400);
+            return res.status(400).json({ success: false, message: 'Invalid Google token' });
         }
 
         const googleUser = await googleRes.json();
         const { email, name, aud } = googleUser;
 
-        // Verify the token was issued for OUR app (audience check)
-        if (c.env.GOOGLE_CLIENT_ID && aud !== c.env.GOOGLE_CLIENT_ID) {
-            return c.json({ success: false, message: 'Invalid Google token audience' }, 400);
+        if (process.env.GOOGLE_CLIENT_ID && aud !== process.env.GOOGLE_CLIENT_ID) {
+            return res.status(400).json({ success: false, message: 'Invalid Google token audience' });
         }
 
         if (!email) {
-            return c.json({ success: false, message: 'Could not retrieve email from Google' }, 400);
+            return res.status(400).json({ success: false, message: 'Could not retrieve email from Google' });
         }
 
-        // Check if user already exists
-        let user = await c.env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email.toLowerCase()).first();
+        let user = await User.findOne({ email: email.toLowerCase() });
 
-        // Block banned users
-        if (user && user.is_banned === 1) {
-            return c.json({
+        if (user && user.isBanned) {
+            return res.status(403).json({
                 success: false,
-                message: `Your account has been suspended.${user.ban_reason ? ' Reason: ' + user.ban_reason : ''}`
-            }, 403);
+                message: `Your account has been suspended.${user.banReason ? ' Reason: ' + user.banReason : ''}`
+            });
         }
 
         if (!user) {
-            const id = generateId();
             const randomPassword = await hashPassword(crypto.randomUUID());
-            const sellerProfile = JSON.stringify({
-                shopName: "", shopDescription: "", bankingInfo: {}, address: {},
-                isVerified: false, verificationDate: null, totalRentals: 0,
-                avgResponseTime: 0, memberSince: new Date().toISOString(),
-                rating: { average: 0, count: 0 }
+            user = await User.create({
+                name: sanitizeInput(name) || email.split('@')[0],
+                email: email.toLowerCase(),
+                password: randomPassword,
+                sellerProfile: {
+                    shopName: '',
+                    shopDescription: '',
+                    bankingInfo: {},
+                    address: {},
+                    isVerified: false,
+                    verificationDate: null,
+                    totalRentals: 0,
+                    avgResponseTime: 0,
+                    memberSince: new Date(),
+                    rating: { average: 0, count: 0 }
+                }
             });
-
-            await c.env.DB.prepare(
-                `INSERT INTO users (id, name, email, password, seller_profile) VALUES (?, ?, ?, ?, ?)`
-            ).bind(id, sanitizeInput(name) || email.split('@')[0], email.toLowerCase(), randomPassword, sellerProfile).run();
-
-            user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(id).first();
         }
 
-        const token = await createToken(user.id, c.env.JWT_SECRET);
-        delete user.password;
-        user.seller_profile = JSON.parse(user.seller_profile || '{}');
-        user.address = JSON.parse(user.address || '{}');
-        user.cart_data = JSON.parse(user.cart_data || '{}');
+        const token = createToken(user._id);
 
-        return c.json({ success: true, token, user: formatUser(user) });
+        return res.json({ success: true, token, user: user.toClientJSON() });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── Admin Login ────────────────────────────────────────────────────
-app.post('/admin', rateLimit('admin-login', 5), async (c) => {
+router.post('/admin', async (req, res) => {
     try {
-        const { email, password } = await c.req.json();
+        const { email, password } = req.body;
+        const adminEmail = (process.env.ADMIN_EMAIL || 'admin@revastra.com').toLowerCase().trim();
+        const adminPassword = (process.env.ADMIN_PASSWORD || 'admin@0027').trim();
 
-        if (email === c.env.ADMIN_EMAIL && password === c.env.ADMIN_PASSWORD) {
-            const secretKey = new TextEncoder().encode(c.env.JWT_SECRET);
-            const token = await new (await import('jose')).SignJWT({ role: 'admin' })
-                .setProtectedHeader({ alg: 'HS256' })
-                .setIssuedAt()
-                .setExpirationTime('8h')
-                .sign(secretKey);
-            return c.json({ success: true, token });
+        const inputEmail = (email || '').toLowerCase().trim();
+        const inputPassword = (password || '').trim();
+
+        if (inputEmail === adminEmail && inputPassword === adminPassword) {
+            const token = createAdminToken({ role: 'admin', email: adminEmail });
+            return res.json({ success: true, token });
         }
 
-        return c.json({ success: false, message: 'Invalid Credentials' }, 401);
+        // Also check if user exists in DB with matching credentials
+        const dbUser = await User.findOne({ email: inputEmail });
+        if (dbUser && dbUser.email === adminEmail) {
+            const { valid } = await verifyPassword(inputPassword, dbUser.password);
+            if (valid) {
+                const token = createAdminToken({ role: 'admin', email: dbUser.email, id: dbUser._id });
+                return res.json({ success: true, token });
+            }
+        }
+
+        return res.status(401).json({
+            success: false,
+            message: 'Invalid Credentials. Default admin is admin@revastra.com'
+        });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── User Profile ───────────────────────────────────────────────────
-app.get('/profile', authUser, checkBanned, async (c) => {
+router.get('/profile', authUser, checkBanned, async (req, res) => {
     try {
-        const userId = c.get('userId');
-        const user = await c.env.DB.prepare(
-            'SELECT id, name, email, phone, address, cart_data, is_seller, seller_profile, is_banned, ban_reason, created_at FROM users WHERE id = ?'
-        ).bind(userId).first();
-
+        const user = await User.findById(req.userId);
         if (!user) {
-            return c.json({ success: false, message: 'User not found' }, 404);
+            return res.status(404).json({ success: false, message: 'User not found' });
         }
 
-        user.seller_profile = JSON.parse(user.seller_profile || '{}');
-        user.address = JSON.parse(user.address || '{}');
-        user.cart_data = JSON.parse(user.cart_data || '{}');
-
-        return c.json({ success: true, user: formatUser(user) });
+        return res.json({ success: true, user: user.toClientJSON() });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── Update Profile ─────────────────────────────────────────────────
-app.post('/update', authUser, checkBanned, async (c) => {
+router.post('/update', authUser, checkBanned, async (req, res) => {
     try {
-        const userId = c.get('userId');
-        const { name, phone, address } = await c.req.json();
-
-        const updates = [];
-        const values = [];
+        const { name, phone, address } = req.body;
+        const user = await User.findById(req.userId);
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
 
         if (name) {
             const cleanName = sanitizeInput(name);
-            if (cleanName.length > 100) return c.json({ success: false, message: 'Name is too long' }, 400);
-            updates.push('name = ?'); values.push(cleanName);
+            if (cleanName.length > 100) return res.status(400).json({ success: false, message: 'Name is too long' });
+            user.name = cleanName;
         }
+
         if (phone) {
             const cleanPhone = sanitizeInput(phone);
-            if (cleanPhone.length > 20) return c.json({ success: false, message: 'Invalid phone number' }, 400);
-            updates.push('phone = ?'); values.push(cleanPhone);
-        }
-        if (address) { updates.push('address = ?'); values.push(JSON.stringify(address)); }
-
-        if (updates.length > 0) {
-            values.push(userId);
-            await c.env.DB.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).bind(...values).run();
+            if (cleanPhone.length > 20) return res.status(400).json({ success: false, message: 'Invalid phone number' });
+            user.phone = cleanPhone;
         }
 
-        const user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
-        delete user.password;
-        user.seller_profile = JSON.parse(user.seller_profile || '{}');
-        user.address = JSON.parse(user.address || '{}');
+        if (address) {
+            user.address = address;
+        }
 
-        return c.json({ success: true, message: 'Profile updated successfully.', user });
+        await user.save();
+
+        return res.json({
+            success: true,
+            message: 'Profile updated successfully.',
+            user: user.toClientJSON()
+        });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── Apply for Seller ───────────────────────────────────────────────
-app.post('/apply-seller', authUser, checkBanned, async (c) => {
+const becomeSellerHandler = async (req, res) => {
     try {
-        const userId = c.get('userId');
-        const { shopName, shopDescription, bankingInfo, address } = await c.req.json();
+        const { shopName, shopDescription, bankingInfo, address } = req.body;
 
         if (!shopName || !bankingInfo || !address) {
-            return c.json({ success: false, message: 'Missing required seller details.' }, 400);
+            return res.status(400).json({ success: false, message: 'Missing required seller details.' });
         }
 
-        const sellerProfile = JSON.stringify({
-            shopName: sanitizeInput(shopName), shopDescription: sanitizeInput(shopDescription) || "",
-            bankingInfo, address, isVerified: false, verificationDate: null,
-            totalRentals: 0, avgResponseTime: 0, memberSince: new Date().toISOString(),
-            rating: { average: 0, count: 0 }
-        });
-
-        await c.env.DB.prepare('UPDATE users SET is_seller = 1, seller_profile = ? WHERE id = ?')
-            .bind(sellerProfile, userId).run();
-
-        const user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
-        delete user.password;
-        user.seller_profile = JSON.parse(user.seller_profile || '{}');
-        user.cart_data = JSON.parse(user.cart_data || '{}');
-
-        return c.json({ success: true, message: 'Congratulations! You are now a seller. 🚀', user: formatUser(user) });
-    } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
-    }
-});
-
-// Alias for become-seller (frontend uses this route)
-app.post('/become-seller', authUser, checkBanned, async (c) => {
-    try {
-        const userId = c.get('userId');
-        const { shopName, shopDescription, bankingInfo, address } = await c.req.json();
-
-        if (!shopName || !bankingInfo || !address) {
-            return c.json({ success: false, message: 'Missing required seller details.' }, 400);
+        const user = await User.findById(req.userId);
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found' });
         }
 
-        const sellerProfile = JSON.stringify({
-            shopName: sanitizeInput(shopName), shopDescription: sanitizeInput(shopDescription) || "",
-            bankingInfo, address, isVerified: false, verificationDate: null,
-            totalRentals: 0, avgResponseTime: 0, memberSince: new Date().toISOString(),
+        user.isSeller = true;
+        user.sellerProfile = {
+            shopName: sanitizeInput(shopName),
+            shopDescription: sanitizeInput(shopDescription) || '',
+            bankingInfo,
+            address,
+            isVerified: false,
+            verificationDate: null,
+            totalRentals: 0,
+            avgResponseTime: 0,
+            memberSince: new Date(),
             rating: { average: 0, count: 0 }
+        };
+
+        await user.save();
+
+        return res.json({
+            success: true,
+            message: 'Congratulations! You are now a seller. 🚀',
+            user: user.toClientJSON()
         });
-
-        await c.env.DB.prepare('UPDATE users SET is_seller = 1, seller_profile = ? WHERE id = ?')
-            .bind(sellerProfile, userId).run();
-
-        const user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
-        delete user.password;
-        user.seller_profile = JSON.parse(user.seller_profile || '{}');
-        user.cart_data = JSON.parse(user.cart_data || '{}');
-
-        return c.json({ success: true, message: 'Congratulations! You are now a seller. 🚀', user: formatUser(user) });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
-});
+};
+
+router.post('/apply-seller', authUser, checkBanned, becomeSellerHandler);
+router.post('/become-seller', authUser, checkBanned, becomeSellerHandler);
 
 // ── Admin: Get All Sellers ─────────────────────────────────────────
-app.get('/sellers', adminAuth, async (c) => {
+const getSellersHandler = async (req, res) => {
     try {
-        const { results } = await c.env.DB.prepare(
-            'SELECT id, name, email, phone, is_seller, seller_profile, is_banned, ban_reason, created_at FROM users WHERE is_seller = 1'
-        ).all();
+        const sellers = await User.find({ isSeller: true }).sort({ createdAt: -1 });
 
-        const sellers = results.map(s => {
-            const profile = JSON.parse(s.seller_profile || '{}');
+        const formatted = sellers.map(s => {
+            const cUser = s.toClientJSON();
             return {
-                _id: s.id, name: s.name, email: s.email, phone: s.phone,
-                isBanned: s.is_banned === 1, banReason: s.ban_reason,
-                createdAt: s.created_at, sellerProfile: profile
+                _id: cUser._id,
+                name: cUser.name,
+                email: cUser.email,
+                phone: cUser.phone,
+                isBanned: cUser.isBanned,
+                banReason: cUser.banReason,
+                createdAt: cUser.createdAt,
+                sellerProfile: cUser.sellerProfile
             };
         });
 
-        return c.json({ success: true, sellers });
+        return res.json({ success: true, sellers: formatted });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
-});
+};
 
-app.post('/sellers', adminAuth, async (c) => {
+router.get('/sellers', adminAuth, getSellersHandler);
+router.post('/sellers', adminAuth, getSellersHandler);
+
+// ── Admin: Ban / Unban Seller ──────────────────────────────────────
+router.post('/ban', adminAuth, async (req, res) => {
     try {
-        const { results } = await c.env.DB.prepare(
-            'SELECT id, name, email, phone, is_seller, seller_profile, is_banned, ban_reason, created_at FROM users WHERE is_seller = 1'
-        ).all();
-
-        const sellers = results.map(s => {
-            const profile = JSON.parse(s.seller_profile || '{}');
-            return {
-                _id: s.id, name: s.name, email: s.email, phone: s.phone,
-                isBanned: s.is_banned === 1, banReason: s.ban_reason,
-                createdAt: s.created_at, sellerProfile: profile
-            };
-        });
-
-        return c.json({ success: true, sellers });
-    } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
-    }
-});
-
-// ── Admin: Ban Seller ──────────────────────────────────────────────
-app.post('/ban', adminAuth, async (c) => {
-    try {
-        const { userId, isBanned, banReason } = await c.req.json();
+        const { userId, isBanned, banReason } = req.body;
 
         if (!userId) {
-            return c.json({ success: false, message: 'User ID is required' }, 400);
+            return res.status(400).json({ success: false, message: 'User ID is required' });
         }
 
-        await c.env.DB.prepare('UPDATE users SET is_banned = ?, ban_reason = ? WHERE id = ?')
-            .bind(isBanned ? 1 : 0, isBanned ? sanitizeInput(banReason) || '' : '', userId).run();
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
 
-        return c.json({ success: true, message: isBanned ? 'Seller banned successfully.' : 'Seller unbanned successfully.' });
+        user.isBanned = Boolean(isBanned);
+        user.banReason = isBanned ? (sanitizeInput(banReason) || '') : '';
+        await user.save();
+
+        return res.json({
+            success: true,
+            message: isBanned ? 'Seller banned successfully.' : 'Seller unbanned successfully.'
+        });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── Admin: Verify Seller ───────────────────────────────────────────
-app.post('/verify', adminAuth, async (c) => {
+router.post('/verify', adminAuth, async (req, res) => {
     try {
-        const { userId, isVerified } = await c.req.json();
+        const { userId, isVerified } = req.body;
 
         if (!userId) {
-            return c.json({ success: false, message: 'User ID is required' }, 400);
+            return res.status(400).json({ success: false, message: 'User ID is required' });
         }
 
-        const user = await c.env.DB.prepare('SELECT seller_profile FROM users WHERE id = ? AND is_seller = 1').bind(userId).first();
+        const user = await User.findOne({ _id: userId, isSeller: true });
         if (!user) {
-            return c.json({ success: false, message: 'Seller not found.' }, 404);
+            return res.status(404).json({ success: false, message: 'Seller not found.' });
         }
 
-        const sellerProfile = JSON.parse(user.seller_profile || '{}');
-        sellerProfile.isVerified = isVerified;
-        if (isVerified) sellerProfile.verificationDate = new Date().toISOString();
+        const profile = user.sellerProfile || {};
+        profile.isVerified = Boolean(isVerified);
+        if (isVerified) {
+            profile.verificationDate = new Date();
+        }
+        user.sellerProfile = profile;
+        user.markModified('sellerProfile');
+        await user.save();
 
-        await c.env.DB.prepare('UPDATE users SET seller_profile = ? WHERE id = ?')
-            .bind(JSON.stringify(sellerProfile), userId).run();
-
-        return c.json({ success: true, message: isVerified ? 'Seller verified successfully! ✓' : 'Seller verification removed.' });
+        return res.json({
+            success: true,
+            message: isVerified ? 'Seller verified successfully! ✓' : 'Seller verification removed.'
+        });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
-export default app;
+export default router;

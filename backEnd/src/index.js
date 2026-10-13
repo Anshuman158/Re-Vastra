@@ -1,59 +1,119 @@
-import { Hono } from 'hono';
-import { cors } from 'hono/cors';
-import { securityHeaders, limitBodySize } from './middleware/auth.js';
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import morgan from 'morgan';
+import path from 'path';
+import connectDB from './config/db.js';
+import connectCloudinary from './config/cloudinary.js';
+
+// Route imports
 import userRoutes from './routes/user.js';
 import productRoutes from './routes/product.js';
 import cartRoutes from './routes/cart.js';
 import orderRoutes from './routes/order.js';
 import reviewRoutes from './routes/review.js';
-import statsRoutes from './routes/stats.js';
 import notificationRoutes from './routes/notification.js';
+import statsRoutes from './routes/stats.js';
 
-const app = new Hono();
+const app = express();
+const PORT = process.env.PORT || 8787;
 
-// Security: Request body size limit (1MB)
-app.use('*', limitBodySize(1_048_576));
+// Initialize Database & Cloudinary
+connectDB();
+connectCloudinary();
 
-// Security: Add security headers to all responses
-app.use('*', securityHeaders);
+// ── Security & Middleware ──────────────────────────────────────────
 
-// CORS middleware — locked to allowed origins
-app.use('*', async (c, next) => {
-    const allowedOrigins = (c.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean);
+// Helmet with cross-origin resource policy disabled for static uploads
+app.use(helmet({
+    crossOriginResourcePolicy: false
+}));
 
-    // If no origins configured, fall back to open (dev mode)
-    const origin = c.req.header('origin') || '';
-    const isAllowed = allowedOrigins.length === 0 || allowedOrigins.includes(origin);
+// Allowed CORS origins
+const defaultOrigins = [
+    'https://re-vastra.vercel.app',
+    'https://re-vastra-admin.vercel.app',
+    'https://revastra.online',
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:5175',
+    'http://localhost:3000',
+    'http://localhost:8787',
+    'http://localhost:4000'
+];
 
-    const corsMiddleware = cors({
-        origin: isAllowed ? origin : allowedOrigins[0] || '*',
-        allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-        allowHeaders: ['Content-Type', 'Authorization', 'token'],
-        maxAge: 86400 // preflight cache 24h
+const customOrigins = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean);
+
+const allowedOrigins = customOrigins.length > 0 ? customOrigins : defaultOrigins;
+
+app.use(cors({
+    origin: (origin, callback) => {
+        // Allow requests with no origin (e.g. mobile apps, curl, Postman) or matched origins
+        if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+            callback(null, true);
+        } else {
+            callback(null, true); // Fallback to allow during local development
+        }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'token']
+}));
+
+// Body parsers
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Logging
+if (process.env.NODE_ENV !== 'production') {
+    app.use(morgan('dev'));
+}
+
+// Static files for uploaded images
+app.use('/uploads', express.static(path.resolve('uploads')));
+
+// ── Health Check ───────────────────────────────────────────────────
+app.get('/', (req, res) => {
+    res.json({
+        message: 'ReVastra API Working',
+        status: 'ok',
+        stack: 'MERN (MongoDB, Express, React, Node.js)'
     });
-
-    return corsMiddleware(c, next);
 });
 
-// Health check
-app.get('/', (c) => c.json({ message: 'ReVastra API Working', status: 'ok' }));
+// ── API Routes ─────────────────────────────────────────────────────
+app.use('/api/user', userRoutes);
+app.use('/api/product', productRoutes);
+app.use('/api/cart', cartRoutes);
+app.use('/api/order', orderRoutes);
+app.use('/api/review', reviewRoutes);
+app.use('/api/notification', notificationRoutes);
+app.use('/api/stats', statsRoutes);
+app.use('/api', statsRoutes); // Support both /api/stats and /api router
 
-// API routes
-app.route('/api/user', userRoutes);
-app.route('/api/product', productRoutes);
-app.route('/api/cart', cartRoutes);
-app.route('/api/order', orderRoutes);
-app.route('/api/review', reviewRoutes);
-app.route('/api/notification', notificationRoutes);
-app.route('/api', statsRoutes);
-
-// 404 handler
-app.notFound((c) => c.json({ success: false, message: 'Route not found' }, 404));
-
-// Error handler — sanitized, no internal details leaked
-app.onError((err, c) => {
-    console.error('Unhandled error:', err);
-    return c.json({ success: false, message: 'An unexpected error occurred.' }, 500);
+// ── 404 Handler ────────────────────────────────────────────────────
+app.use((req, res) => {
+    res.status(404).json({ success: false, message: 'Route not found' });
 });
+
+// ── Central Error Handler ──────────────────────────────────────────
+app.use((err, req, res, next) => {
+    console.error('Unhandled server error:', err);
+    res.status(err.status || 500).json({
+        success: false,
+        message: err.message || 'An unexpected error occurred.'
+    });
+});
+
+// ── Start Server ───────────────────────────────────────────────────
+if (process.env.NODE_ENV !== 'test') {
+    app.listen(PORT, () => {
+        console.log(`🚀 ReVastra MERN Server running on http://localhost:${PORT}`);
+    });
+}
 
 export default app;

@@ -1,165 +1,189 @@
-import { Hono } from 'hono';
-import { generateId, authUser, sanitizeError, sanitizeInput } from '../middleware/auth.js';
+import express from 'express';
+import mongoose from 'mongoose';
+import Review from '../models/Review.js';
+import Order from '../models/Order.js';
+import Product from '../models/Product.js';
+import User from '../models/User.js';
+import { authUser, sanitizeInput, sanitizeError } from '../middleware/auth.js';
 
-const app = new Hono();
+const router = express.Router();
 
 // ── Auth: Add review ───────────────────────────────────────────────
-app.post('/add', authUser, async (c) => {
+router.post('/add', authUser, async (req, res) => {
     try {
-        const userId = c.get('userId'); // From auth token, NOT from request body
-        const { orderId, rating, subRatings, comment, isAnonymous } = await c.req.json();
+        const userId = req.userId;
+        const { orderId, rating, subRatings, comment, isAnonymous } = req.body;
 
         if (!orderId || !rating) {
-            return c.json({ success: false, message: 'Order ID and rating are required' }, 400);
+            return res.status(400).json({ success: false, message: 'Order ID and rating are required' });
         }
 
-        // Validate rating range
-        if (typeof rating !== 'number' || rating < 1 || rating > 5) {
-            return c.json({ success: false, message: 'Rating must be between 1 and 5' }, 400);
+        const numRating = Number(rating);
+        if (numRating < 1 || numRating > 5) {
+            return res.status(400).json({ success: false, message: 'Rating must be between 1 and 5' });
         }
 
-        // Check if order exists and belongs to the authenticated user
-        const order = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(orderId).first();
+        if (!mongoose.Types.ObjectId.isValid(orderId)) {
+            return res.status(404).json({ success: false, message: 'Order not found' });
+        }
+
+        const order = await Order.findById(orderId);
         if (!order) {
-            return c.json({ success: false, message: 'Order not found' }, 404);
+            return res.status(404).json({ success: false, message: 'Order not found' });
         }
-        if (order.user_id !== userId) {
-            return c.json({ success: false, message: 'You can only review your own orders' }, 403);
+
+        if (order.userId.toString() !== userId.toString()) {
+            return res.status(403).json({ success: false, message: 'You can only review your own orders' });
         }
+
         if (order.status !== 'Delivered') {
-            return c.json({ success: false, message: 'Can only review after delivery' }, 400);
+            return res.status(400).json({ success: false, message: 'Can only review after delivery' });
         }
 
-        // Get seller from first item
-        const firstItem = await c.env.DB.prepare('SELECT product_id FROM order_items WHERE order_id = ? LIMIT 1').bind(orderId).first();
-        if (!firstItem) {
-            return c.json({ success: false, message: 'No items found for this order' }, 404);
+        if (!order.items || order.items.length === 0) {
+            return res.status(404).json({ success: false, message: 'No items found for this order' });
         }
 
-        const product = await c.env.DB.prepare('SELECT user_id FROM products WHERE id = ?').bind(firstItem.product_id).first();
+        const firstProductId = order.items[0].productId;
+        const product = await Product.findById(firstProductId);
         if (!product) {
-            return c.json({ success: false, message: 'Seller not found for this order' }, 404);
+            return res.status(404).json({ success: false, message: 'Seller not found for this order' });
         }
-        const sellerId = product.user_id;
+
+        const sellerId = product.userId;
 
         // Prevent duplicate reviews
-        const existing = await c.env.DB.prepare('SELECT id FROM reviews WHERE order_id = ? AND reviewer_id = ?').bind(orderId, userId).first();
+        const existing = await Review.findOne({ orderId, reviewerId: userId });
         if (existing) {
-            return c.json({ success: false, message: 'You have already reviewed this order' }, 400);
+            return res.status(400).json({ success: false, message: 'You have already reviewed this order' });
         }
 
-        // Create review with sanitized comment
-        const reviewId = generateId();
         const cleanComment = sanitizeInput(comment) || '';
         if (cleanComment.length > 2000) {
-            return c.json({ success: false, message: 'Review comment is too long (max 2000 characters)' }, 400);
+            return res.status(400).json({ success: false, message: 'Review comment is too long (max 2000 characters)' });
         }
 
-        await c.env.DB.prepare(
-            `INSERT INTO reviews (id, order_id, reviewer_id, seller_id, rating, sub_ratings, comment, is_anonymous)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-        ).bind(reviewId, orderId, userId, sellerId, rating, JSON.stringify(subRatings || {}), cleanComment, isAnonymous ? 1 : 0).run();
+        await Review.create({
+            orderId,
+            reviewerId: userId,
+            sellerId,
+            rating: numRating,
+            subRatings: subRatings || {},
+            comment: cleanComment,
+            isAnonymous: Boolean(isAnonymous)
+        });
 
         // Update seller's average rating
-        const { results: allReviews } = await c.env.DB.prepare('SELECT rating FROM reviews WHERE seller_id = ?').bind(sellerId).all();
+        const allReviews = await Review.find({ sellerId }).select('rating');
         const avgRating = allReviews.reduce((sum, r) => sum + r.rating, 0) / allReviews.length;
 
-        const seller = await c.env.DB.prepare('SELECT seller_profile FROM users WHERE id = ?').bind(sellerId).first();
-        const sellerProfile = JSON.parse(seller.seller_profile || '{}');
-        sellerProfile.rating = { average: Math.round(avgRating * 10) / 10, count: allReviews.length };
+        const seller = await User.findById(sellerId);
+        if (seller) {
+            const profile = seller.sellerProfile || {};
+            profile.rating = {
+                average: Math.round(avgRating * 10) / 10,
+                count: allReviews.length
+            };
+            seller.sellerProfile = profile;
+            seller.markModified('sellerProfile');
+            await seller.save();
+        }
 
-        await c.env.DB.prepare('UPDATE users SET seller_profile = ? WHERE id = ?')
-            .bind(JSON.stringify(sellerProfile), sellerId).run();
-
-        return c.json({ success: true, message: 'Review submitted successfully' });
+        return res.json({ success: true, message: 'Review submitted successfully' });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── Public: Get seller reviews ─────────────────────────────────────
-app.get('/seller/:sellerId', async (c) => {
+router.get('/seller/:sellerId', async (req, res) => {
     try {
-        const sellerId = c.req.param('sellerId');
+        const { sellerId } = req.params;
 
-        const { results: reviews } = await c.env.DB.prepare(
-            `SELECT r.*, u.name as reviewer_name 
-             FROM reviews r 
-             LEFT JOIN users u ON r.reviewer_id = u.id 
-             WHERE r.seller_id = ? 
-             ORDER BY r.created_at DESC 
-             LIMIT 20`
-        ).bind(sellerId).all();
+        if (!mongoose.Types.ObjectId.isValid(sellerId)) {
+            return res.status(404).json({ success: false, message: 'Invalid seller ID' });
+        }
 
-        const formattedReviews = reviews.map(r => ({
-            ...r, _id: r.id,
-            sub_ratings: JSON.parse(r.sub_ratings || '{}'),
-            reviewerName: r.is_anonymous ? 'Anonymous' : r.reviewer_name || 'User'
-        }));
+        const reviews = await Review.find({ sellerId })
+            .populate('reviewerId', 'name')
+            .sort({ createdAt: -1 })
+            .limit(20);
 
-        return c.json({ success: true, reviews: formattedReviews });
+        const formatted = reviews.map(r => {
+            const reviewerName = r.reviewerId?.name || 'User';
+            return r.toClientJSON(reviewerName);
+        });
+
+        return res.json({ success: true, reviews: formatted });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
-// ── Auth: Check if can review ──────────────────────────────────────
-app.get('/can-review/:orderId', authUser, async (c) => {
+// ── Auth: Check if user can review order ───────────────────────────
+router.get('/can-review/:orderId', authUser, async (req, res) => {
     try {
-        const orderId = c.req.param('orderId');
-        const userId = c.get('userId'); // From auth token
+        const { orderId } = req.params;
+        const userId = req.userId;
 
-        const order = await c.env.DB.prepare('SELECT * FROM orders WHERE id = ?').bind(orderId).first();
-        if (!order || order.user_id !== userId) {
-            return c.json({ success: false, canReview: false });
+        if (!mongoose.Types.ObjectId.isValid(orderId)) {
+            return res.json({ success: false, canReview: false });
         }
 
-        const existing = await c.env.DB.prepare('SELECT id FROM reviews WHERE order_id = ? AND reviewer_id = ?').bind(orderId, userId).first();
+        const order = await Order.findById(orderId);
+        if (!order || order.userId.toString() !== userId.toString()) {
+            return res.json({ success: false, canReview: false });
+        }
+
+        const existing = await Review.findOne({ orderId, reviewerId: userId });
         const canReview = order.status === 'Delivered' && !existing;
 
-        return c.json({ success: true, canReview, hasReviewed: !!existing });
-    } catch (error) {
-        return c.json({ success: false, canReview: false });
+        return res.json({ success: true, canReview, hasReviewed: Boolean(existing) });
+    } catch {
+        return res.json({ success: false, canReview: false });
     }
 });
 
-// ── Public: Get seller profile ─────────────────────────────────────
-app.get('/profile/:sellerId', async (c) => {
+// ── Public: Get seller public profile ──────────────────────────────
+router.get('/profile/:sellerId', async (req, res) => {
     try {
-        const sellerId = c.req.param('sellerId');
+        const { sellerId } = req.params;
 
-        const seller = await c.env.DB.prepare(
-            'SELECT id, name, seller_profile, is_seller, created_at FROM users WHERE id = ?'
-        ).bind(sellerId).first();
-
-        if (!seller || !seller.is_seller) {
-            return c.json({ success: false, message: 'Seller not found' }, 404);
+        if (!mongoose.Types.ObjectId.isValid(sellerId)) {
+            return res.status(404).json({ success: false, message: 'Seller not found' });
         }
 
-        const profile = JSON.parse(seller.seller_profile || '{}');
+        const seller = await User.findOne({ _id: sellerId, isSeller: true });
+        if (!seller) {
+            return res.status(404).json({ success: false, message: 'Seller not found' });
+        }
+
+        const profile = seller.sellerProfile || {};
         const rentals = profile.totalRentals || 0;
+
         let badge = 'new';
         if (rentals >= 50) badge = 'top';
         else if (rentals >= 25) badge = 'popular';
         else if (rentals >= 5) badge = 'rising';
 
-        return c.json({
+        return res.json({
             success: true,
             seller: {
-                _id: seller.id, name: seller.name,
+                _id: seller._id.toString(),
+                name: seller.name,
                 shopName: profile.shopName || seller.name,
                 isVerified: profile.isVerified || false,
                 verificationDate: profile.verificationDate,
                 totalRentals: rentals,
                 avgResponseTime: profile.avgResponseTime || 0,
-                memberSince: profile.memberSince || seller.created_at,
+                memberSince: profile.memberSince || seller.createdAt,
                 rating: profile.rating || { average: 0, count: 0 },
                 badge
             }
         });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
-export default app;
+export default router;

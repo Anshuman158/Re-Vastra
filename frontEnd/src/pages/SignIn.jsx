@@ -174,6 +174,18 @@ const SignIn = () => {
               </>
             )}
           </button>
+
+          {currentState === 'Login' && (
+            <button
+              type="button"
+              onClick={() => {
+                setFormData({ name: '', email: 'user@revastra.com', password: 'password123' });
+              }}
+              className="w-full py-2 bg-neutral-100 hover:bg-neutral-200 dark:bg-neutral-700 dark:hover:bg-neutral-600 text-neutral-700 dark:text-neutral-200 text-xs font-medium rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+            >
+              <span>👤</span> Fill Demo User (user@revastra.com)
+            </button>
+          )}
         </form>
 
         {/* Divider */}

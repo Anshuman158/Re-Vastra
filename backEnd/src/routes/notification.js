@@ -1,69 +1,60 @@
-import { Hono } from 'hono';
+import express from 'express';
+import Notification from '../models/Notification.js';
 import { authUser, sanitizeError } from '../middleware/auth.js';
 
-const app = new Hono();
+const router = express.Router();
 
 // ── Auth: Get notifications ───────────────────────────────────────
-app.get('/list', authUser, async (c) => {
+router.get('/list', authUser, async (req, res) => {
     try {
-        const userId = c.get('userId');
-        const { results } = await c.env.DB.prepare(
-            'SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50'
-        ).bind(userId).all();
+        const notifications = await Notification.find({ userId: req.userId })
+            .sort({ createdAt: -1 })
+            .limit(50);
 
-        const notifications = results.map(n => ({
-            _id: n.id,
-            title: n.title,
-            message: n.message,
-            type: n.type,
-            orderId: n.order_id,
-            isRead: n.is_read === 1,
-            createdAt: n.created_at
-        }));
+        const formatted = notifications.map(n => n.toClientJSON());
 
-        return c.json({ success: true, notifications });
+        return res.json({ success: true, notifications: formatted });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── Auth: Get unread count ────────────────────────────────────────
-app.get('/unread-count', authUser, async (c) => {
+router.get('/unread-count', authUser, async (req, res) => {
     try {
-        const userId = c.get('userId');
-        const result = await c.env.DB.prepare(
-            'SELECT COUNT(*) as count FROM notifications WHERE user_id = ? AND is_read = 0'
-        ).bind(userId).first();
+        const count = await Notification.countDocuments({
+            userId: req.userId,
+            isRead: false
+        });
 
-        return c.json({ success: true, count: result?.count || 0 });
+        return res.json({ success: true, count });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── Auth: Mark notifications as read ──────────────────────────────
-app.post('/read', authUser, async (c) => {
+router.post('/read', authUser, async (req, res) => {
     try {
-        const userId = c.get('userId');
-        const { notificationIds } = await c.req.json();
+        const userId = req.userId;
+        const { notificationIds } = req.body;
 
         if (notificationIds && Array.isArray(notificationIds) && notificationIds.length > 0) {
-            // Mark specific notifications as read
-            const placeholders = notificationIds.map(() => '?').join(',');
-            await c.env.DB.prepare(
-                `UPDATE notifications SET is_read = 1 WHERE id IN (${placeholders}) AND user_id = ?`
-            ).bind(...notificationIds, userId).run();
+            await Notification.updateMany(
+                { _id: { $in: notificationIds }, userId },
+                { isRead: true }
+            );
         } else {
-            // Mark all as read
-            await c.env.DB.prepare(
-                'UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0'
-            ).bind(userId).run();
+            await Notification.updateMany(
+                { userId, isRead: false },
+                { isRead: true }
+            );
         }
 
-        return c.json({ success: true, message: 'Notifications marked as read' });
+        return res.json({ success: true, message: 'Notifications marked as read' });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
-export default app;
+export default router;

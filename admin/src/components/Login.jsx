@@ -109,6 +109,20 @@ const Login = ({ setToken }) => {
                 </>
               )}
             </button>
+
+            {/* Quick Demo Credentials Autofill */}
+            <div className="pt-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setEmail('admin@revastra.com');
+                  setPassword('admin@0027');
+                }}
+                className="w-full py-2.5 bg-gray-800/80 hover:bg-gray-700 text-gray-300 hover:text-white text-xs font-medium rounded-xl border border-gray-700 transition-all flex items-center justify-center gap-2 cursor-pointer shadow-sm"
+              >
+                <span>🔑</span> Fill Default Credentials (admin@revastra.com)
+              </button>
+            </div>
           </form>
 
           {/* Footer */}

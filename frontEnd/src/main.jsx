@@ -6,7 +6,7 @@ import App from './App.jsx';
 import './index.css';
 import ShopContextProvider from './context/ShopContext.jsx';
 
-const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID || '';
+const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID || '519694424269-qhpauerq7f6i89d9jr42hkv8buiq4023.apps.googleusercontent.com';
 
 createRoot(document.getElementById('root')).render(
   <StrictMode>

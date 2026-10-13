@@ -1,4 +1,7 @@
-.vercel
 node_modules
-
-*.env
+.env
+.env.local
+.env.production
+.vercel
+dist
+uploads/

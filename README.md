@@ -149,12 +149,18 @@ The ReVastra platform is built on the battle-tested **MERN (MongoDB, Express.js,
 ReVastra/
 ├── backEnd/                      # Node.js + Express / MERN REST API
 │   ├── src/
-│   │   ├── config/               # Database connection & environmental constants
-│   │   ├── controllers/          # Business logic handlers
-│   │   ├── db/                   # MongoDB/Mongoose connection or D1 schemas
-│   │   ├── middleware/           # authUser, adminAuth, rateLimiter, securityHeaders
-│   │   │   └── auth.js
-│   │   ├── models/               # Mongoose Schemas (User, Product, Order, Review)
+│   │   ├── config/               # Database (Mongoose) connection & Cloudinary setup
+│   │   │   ├── db.js
+│   │   │   └── cloudinary.js
+│   │   ├── middleware/           # authUser, adminAuth, multer, security
+│   │   │   ├── auth.js
+│   │   │   └── multer.js
+│   │   ├── models/               # Mongoose Schemas (User, Product, Order, Review, Notification)
+│   │   │   ├── User.js
+│   │   │   ├── Product.js
+│   │   │   ├── Order.js
+│   │   │   ├── Review.js
+│   │   │   └── Notification.js
 │   │   ├── routes/               # Express route endpoints
 │   │   │   ├── user.js           # Auth, profile, seller registration, admin users
 │   │   │   ├── product.js        # Garment listing, searching, seller products, admin

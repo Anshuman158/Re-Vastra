@@ -1,23 +1,30 @@
-import { Hono } from 'hono';
-import { generateId, authUser, adminAuth, checkBanned, sanitizeError } from '../middleware/auth.js';
+import express from 'express';
+import mongoose from 'mongoose';
+import Order from '../models/Order.js';
+import Product from '../models/Product.js';
+import User from '../models/User.js';
+import Notification from '../models/Notification.js';
+import { authUser, adminAuth, checkBanned, sanitizeError } from '../middleware/auth.js';
 
-const app = new Hono();
+const router = express.Router();
 
 const URGENT_FEE = 100;
 
-// ── Helper: Create notification ───────────────────────────────────
-const createNotification = async (db, userId, title, message, type = 'order', orderId = null) => {
+// Helper: create a notification
+const createNotification = async (userId, title, message, type = 'order', orderId = null) => {
     try {
-        const id = generateId();
-        await db.prepare(
-            'INSERT INTO notifications (id, user_id, title, message, type, order_id) VALUES (?, ?, ?, ?, ?, ?)'
-        ).bind(id, userId, title, message, type, orderId).run();
+        await Notification.create({
+            userId,
+            title,
+            message,
+            type,
+            orderId: orderId ? orderId.toString() : null
+        });
     } catch (e) {
         console.error('Failed to create notification:', e);
     }
 };
 
-// Status-specific notification messages
 const STATUS_MESSAGES = {
     'Order Placed': { title: '📦 Order Confirmed', message: 'Your order has been placed successfully!' },
     'Processing': { title: '⚙️ Order Processing', message: 'Your order is being processed.' },
@@ -31,38 +38,53 @@ const STATUS_MESSAGES = {
 };
 
 // ── Auth: Place order ──────────────────────────────────────────────
-app.post('/place', authUser, checkBanned, async (c) => {
+router.post('/place', authUser, checkBanned, async (req, res) => {
     try {
-        const userId = c.get('userId');
-        const body = await c.req.json();
+        const userId = req.userId;
+        const body = req.body;
 
-        const { amount, items, address, washingFee, deliveryFee, securityDeposit, rentalStartDate, rentalEndDate, deliveryDate, urgentOrder, pricingBreakdown } = body;
+        const {
+            amount,
+            items,
+            address,
+            washingFee,
+            deliveryFee,
+            securityDeposit,
+            rentalStartDate,
+            rentalEndDate,
+            deliveryDate,
+            urgentOrder,
+            pricingBreakdown
+        } = body;
 
         if (!amount || !items || !address) {
-            return c.json({ success: false, message: 'All fields are required.' }, 400);
+            return res.status(400).json({ success: false, message: 'All fields are required.' });
         }
 
         if (!Array.isArray(items) || items.length === 0) {
-            return c.json({ success: false, message: 'Order must contain at least one item.' }, 400);
+            return res.status(400).json({ success: false, message: 'Order must contain at least one item.' });
         }
 
         if (items.length > 50) {
-            return c.json({ success: false, message: 'Too many items in order.' }, 400);
+            return res.status(400).json({ success: false, message: 'Too many items in order.' });
         }
 
-        if (Number(amount) <= 0 || Number(amount) > 10000000) {
-            return c.json({ success: false, message: 'Invalid order amount.' }, 400);
+        const numericAmount = Number(amount);
+        if (numericAmount <= 0 || numericAmount > 10000000) {
+            return res.status(400).json({ success: false, message: 'Invalid order amount.' });
         }
 
-        // Validate all items are available
+        // Validate that all items are active and available
         const unavailableItems = [];
         for (const item of items) {
-            if (!item._id) {
+            const itemId = item._id || item.productId;
+            if (!itemId || !mongoose.Types.ObjectId.isValid(itemId)) {
                 unavailableItems.push({ name: item.name || 'Unknown', reason: 'invalid item' });
                 continue;
             }
-            const product = await c.env.DB.prepare('SELECT id, name, status, is_active FROM products WHERE id = ?').bind(item._id).first();
-            if (!product || product.is_active !== 1) {
+
+            const product = await Product.findById(itemId);
+            if (!product || !product.isActive) {
                 unavailableItems.push({ name: item.name || 'Unknown Product', reason: 'not found' });
             } else if (product.status !== 'available') {
                 unavailableItems.push({ name: product.name, reason: 'unavailable' });
@@ -71,259 +93,265 @@ app.post('/place', authUser, checkBanned, async (c) => {
 
         if (unavailableItems.length > 0) {
             const names = unavailableItems.map(i => `"${i.name}"`).join(', ');
-            return c.json({
+            return res.status(400).json({
                 success: false,
                 message: `Cannot place order. The following item(s) are no longer available: ${names}. Please remove them from your cart and try again.`
-            }, 400);
+            });
         }
 
-        const orderId = generateId();
         const urgentFee = urgentOrder ? URGENT_FEE : 0;
 
-        await c.env.DB.prepare(
-            `INSERT INTO orders (id, user_id, amount, address, status, payment_method, payment, washing_fee, delivery_fee, security_deposit, rental_start_date, rental_end_date, delivery_date, urgent_order, urgent_fee, pricing_breakdown)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).bind(
-            orderId, userId, amount, JSON.stringify(address), 'Order Placed', 'COD', 0,
-            washingFee || 0, deliveryFee || 0, securityDeposit || 0,
-            rentalStartDate || null, rentalEndDate || null, deliveryDate || null,
-            urgentOrder ? 1 : 0, urgentFee,
-            pricingBreakdown ? JSON.stringify(pricingBreakdown) : null
-        ).run();
+        const formattedItems = items.map(item => ({
+            productId: item._id || item.productId,
+            name: item.name,
+            image: Array.isArray(item.image) ? item.image : (item.image ? [item.image] : []),
+            size: item.size || '',
+            quantity: Number(item.quantity) || 1,
+            duration: Number(item.duration) || 1,
+            rentalPrice: Number(item.rental_price || item.rentalPrice) || 0
+        }));
 
-        for (const item of items) {
-            const itemId = generateId();
-            await c.env.DB.prepare(
-                `INSERT INTO order_items (id, order_id, product_id, name, image, size, quantity, duration, rental_price)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-            ).bind(
-                itemId, orderId, item._id, item.name,
-                JSON.stringify(item.image || []), item.size,
-                item.quantity || 1, item.duration || 1, item.rental_price || 0
-            ).run();
-        }
+        const newOrder = await Order.create({
+            userId,
+            items: formattedItems,
+            amount: numericAmount,
+            address,
+            status: 'Order Placed',
+            paymentMethod: 'COD',
+            payment: false,
+            washingFee: Number(washingFee) || 0,
+            deliveryFee: Number(deliveryFee) || 0,
+            securityDeposit: Number(securityDeposit) || 0,
+            rentalStartDate: rentalStartDate || null,
+            rentalEndDate: rentalEndDate || null,
+            deliveryDate: deliveryDate || null,
+            urgentOrder: Boolean(urgentOrder),
+            urgentFee,
+            pricingBreakdown: pricingBreakdown || null
+        });
 
-        // Clear cart
-        await c.env.DB.prepare('UPDATE users SET cart_data = ? WHERE id = ?').bind('{}', userId).run();
+        // Clear user cart
+        await User.findByIdAndUpdate(userId, { cartData: {} });
 
-        // Auto-create confirmation notification
+        // Auto-create confirmation notification for buyer
+        const orderShortId = newOrder._id.toString().slice(-8);
         await createNotification(
-            c.env.DB, userId,
+            userId,
             '📦 Order Confirmed',
-            `Your order #${orderId.slice(-8)} has been placed successfully! ${urgentOrder ? '⚡ Urgent delivery requested.' : ''}`,
-            'order', orderId
+            `Your order #${orderShortId} has been placed successfully! ${urgentOrder ? '⚡ Urgent delivery requested.' : ''}`,
+            'order',
+            newOrder._id.toString()
         );
 
-        return c.json({ success: true, message: 'Order Placed Successfully' });
+        return res.json({ success: true, message: 'Order Placed Successfully' });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── Admin: Get all orders ──────────────────────────────────────────
-app.post('/list', adminAuth, async (c) => {
+router.post('/list', adminAuth, async (req, res) => {
     try {
-        const { results: orders } = await c.env.DB.prepare('SELECT * FROM orders ORDER BY created_at DESC').all();
+        const orders = await Order.find().sort({ createdAt: -1 });
+        const formatted = orders.map(o => o.toClientJSON());
 
-        for (let order of orders) {
-            const { results: items } = await c.env.DB.prepare('SELECT * FROM order_items WHERE order_id = ?').bind(order.id).all();
-            order.items = items.map(item => ({
-                ...item, _id: item.product_id,
-                image: JSON.parse(item.image || '[]')
-            }));
-            order._id = order.id;
-            order.address = JSON.parse(order.address || '{}');
-            order.date = order.created_at;
-            order.urgentOrder = order.urgent_order === 1;
-            order.urgentFee = order.urgent_fee || 0;
-            order.securityDeposit = order.security_deposit || 0;
-            order.washingFee = order.washing_fee || 0;
-            order.deliveryFee = order.delivery_fee || 0;
-            order.rentalStartDate = order.rental_start_date;
-            order.rentalEndDate = order.rental_end_date;
-            order.deliveryDate = order.delivery_date;
-        }
-
-        return c.json({ success: true, orders });
+        return res.json({ success: true, orders: formatted });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── Auth: Get user orders ──────────────────────────────────────────
-app.post('/userorders', authUser, async (c) => {
+router.post('/userorders', authUser, async (req, res) => {
     try {
-        const userId = c.get('userId');
+        const orders = await Order.find({ userId: req.userId }).sort({ createdAt: -1 });
+        const formatted = orders.map(o => o.toClientJSON());
 
-        const { results: orders } = await c.env.DB.prepare(
-            'SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC'
-        ).bind(userId).all();
-
-        for (let order of orders) {
-            const { results: items } = await c.env.DB.prepare('SELECT * FROM order_items WHERE order_id = ?').bind(order.id).all();
-            order.items = items.map(item => ({
-                ...item, _id: item.product_id,
-                image: JSON.parse(item.image || '[]')
-            }));
-            order._id = order.id;
-            order.address = JSON.parse(order.address || '{}');
-            order.date = order.created_at;
-            order.washingFee = order.washing_fee || 0;
-            order.deliveryFee = order.delivery_fee || 0;
-            order.urgentOrder = order.urgent_order === 1;
-            order.urgentFee = order.urgent_fee || 0;
-            order.securityDeposit = order.security_deposit || 0;
-            order.rentalStartDate = order.rental_start_date;
-            order.rentalEndDate = order.rental_end_date;
-            order.deliveryDate = order.delivery_date;
-        }
-
-        return c.json({ success: true, orders });
+        return res.json({ success: true, orders: formatted });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── Admin: Update order status ─────────────────────────────────────
-app.post('/status', adminAuth, async (c) => {
+router.post('/status', adminAuth, async (req, res) => {
     try {
-        const { orderId, status } = await c.req.json();
+        const { orderId, status } = req.body;
 
         if (!orderId || !status) {
-            return c.json({ success: false, message: 'Order ID and status are required.' }, 400);
+            return res.status(400).json({ success: false, message: 'Order ID and status are required.' });
         }
 
-        // Validate status values
-        const validStatuses = ['Order Placed', 'Processing', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled', 'Returned'];
+        const validStatuses = [
+            'Order Placed',
+            'Processing',
+            'Packing',
+            'Shipped',
+            'Out for Delivery',
+            'Out for delivery',
+            'Delivered',
+            'Cancelled',
+            'Returned'
+        ];
+
         if (!validStatuses.includes(status)) {
-            return c.json({ success: false, message: 'Invalid order status.' }, 400);
+            return res.status(400).json({ success: false, message: 'Invalid order status.' });
         }
 
-        const order = await c.env.DB.prepare('SELECT id, user_id, urgent_order FROM orders WHERE id = ?').bind(orderId).first();
+        if (!mongoose.Types.ObjectId.isValid(orderId)) {
+            return res.status(404).json({ success: false, message: 'Order not found.' });
+        }
+
+        const order = await Order.findById(orderId);
         if (!order) {
-            return c.json({ success: false, message: 'Order not found.' }, 404);
+            return res.status(404).json({ success: false, message: 'Order not found.' });
         }
 
-        await c.env.DB.prepare('UPDATE orders SET status = ? WHERE id = ?').bind(status, orderId).run();
+        order.status = status;
+        await order.save();
 
-        // Auto-create notification for the user
+        // Notify user about status change
         const statusMsg = STATUS_MESSAGES[status];
-        if (statusMsg && order.user_id) {
-            const urgentNote = order.urgent_order ? ' ⚡ Urgent' : '';
+        if (statusMsg && order.userId) {
+            const urgentNote = order.urgentOrder ? ' ⚡ Urgent' : '';
             await createNotification(
-                c.env.DB, order.user_id,
+                order.userId,
                 statusMsg.title + urgentNote,
-                statusMsg.message + ` (Order #${orderId.slice(-8)})`,
-                status === 'Delivered' ? 'delivery' : 'order',
-                orderId
+                `${statusMsg.message} (Order #${order._id.toString().slice(-8)})`,
+                status.toLowerCase().includes('delivered') ? 'delivery' : 'order',
+                order._id.toString()
             );
         }
 
-        return c.json({ success: true, message: 'Status Updated' });
+        return res.json({ success: true, message: 'Status Updated' });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── Auth: Get user earnings ────────────────────────────────────────
-app.post('/my_earning', authUser, async (c) => {
+router.post('/my_earning', authUser, async (req, res) => {
     try {
-        const userId = c.get('userId');
+        const userId = req.userId;
 
-        const { results: userProducts } = await c.env.DB.prepare('SELECT id FROM products WHERE user_id = ?').bind(userId).all();
-        const productIds = userProducts.map(p => p.id);
+        // Find products belonging to this seller
+        const userProducts = await Product.find({ userId }).select('_id name');
+        const productIds = userProducts.map(p => p._id);
 
         if (productIds.length === 0) {
-            return c.json({
-                success: true, earnings: [],
-                summary: { totalEarnings: '0.00', pendingEarnings: '0.00', completedEarnings: '0.00', totalOrders: 0 }
+            return res.json({
+                success: true,
+                earnings: [],
+                summary: {
+                    totalEarnings: '0.00',
+                    pendingEarnings: '0.00',
+                    completedEarnings: '0.00',
+                    totalOrders: 0
+                }
             });
         }
 
-        const placeholders = productIds.map(() => '?').join(',');
-        const { results: orderItems } = await c.env.DB.prepare(
-            `SELECT oi.*, o.status, o.created_at as order_date, o.address 
-             FROM order_items oi 
-             JOIN orders o ON oi.order_id = o.id 
-             WHERE oi.product_id IN (${placeholders})`
-        ).bind(...productIds).all();
+        // Find all orders containing any of these products
+        const orders = await Order.find({ 'items.productId': { $in: productIds } }).sort({ createdAt: -1 });
 
-        let earnings = [];
-        let totalEarnings = 0, pendingEarnings = 0, completedEarnings = 0;
+        const earnings = [];
+        let totalEarnings = 0;
+        let pendingEarnings = 0;
+        let completedEarnings = 0;
 
-        for (const item of orderItems) {
-            const itemDuration = item.duration || 1;
-            const itemRentalPrice = item.rental_price || 0;
-            const itemEarning = itemRentalPrice * itemDuration;
-            const platformCharge = itemEarning * 0.15;
-            const netEarning = itemEarning - platformCharge;
+        const prodIdSet = new Set(productIds.map(id => id.toString()));
 
-            earnings.push({
-                orderId: item.order_id, productId: item.product_id,
-                productName: item.name,
-                productImage: JSON.parse(item.image || '[]')[0] || '',
-                size: item.size, duration: itemDuration,
-                grossAmount: itemEarning,
-                platformFee: platformCharge.toFixed(2),
-                netEarning: netEarning.toFixed(2),
-                status: item.status || 'Processing',
-                orderDate: item.order_date,
-                buyerAddress: JSON.parse(item.address || '{}')
-            });
+        for (const order of orders) {
+            for (const item of order.items) {
+                if (item.productId && prodIdSet.has(item.productId.toString())) {
+                    const itemDuration = item.duration || 1;
+                    const itemRentalPrice = item.rentalPrice || 0;
+                    const itemEarning = itemRentalPrice * itemDuration;
+                    const platformCharge = itemEarning * 0.15;
+                    const netEarning = itemEarning - platformCharge;
 
-            totalEarnings += netEarning;
-            if (item.status === 'Delivered') { completedEarnings += netEarning; }
-            else { pendingEarnings += netEarning; }
+                    earnings.push({
+                        orderId: order._id.toString(),
+                        productId: item.productId.toString(),
+                        productName: item.name,
+                        productImage: (item.image && item.image[0]) || '',
+                        size: item.size,
+                        duration: itemDuration,
+                        grossAmount: itemEarning,
+                        platformFee: platformCharge.toFixed(2),
+                        netEarning: netEarning.toFixed(2),
+                        status: order.status || 'Processing',
+                        orderDate: order.createdAt,
+                        buyerAddress: order.address || {}
+                    });
+
+                    totalEarnings += netEarning;
+                    if (order.status === 'Delivered') {
+                        completedEarnings += netEarning;
+                    } else {
+                        pendingEarnings += netEarning;
+                    }
+                }
+            }
         }
 
         earnings.sort((a, b) => new Date(b.orderDate) - new Date(a.orderDate));
 
-        return c.json({
-            success: true, earnings,
+        return res.json({
+            success: true,
+            earnings,
             summary: {
-                totalEarnings: totalEarnings.toFixed(2), pendingEarnings: pendingEarnings.toFixed(2),
-                completedEarnings: completedEarnings.toFixed(2), totalOrders: earnings.length
+                totalEarnings: totalEarnings.toFixed(2),
+                pendingEarnings: pendingEarnings.toFixed(2),
+                completedEarnings: completedEarnings.toFixed(2),
+                totalOrders: earnings.length
             }
         });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
 // ── Auth: Get seller orders ────────────────────────────────────────
-app.post('/seller-orders', authUser, async (c) => {
+router.post('/seller-orders', authUser, async (req, res) => {
     try {
-        const userId = c.get('userId');
+        const userId = req.userId;
 
-        const { results: sellerProducts } = await c.env.DB.prepare('SELECT id FROM products WHERE user_id = ?').bind(userId).all();
-        const productIds = sellerProducts.map(p => p.id);
+        const sellerProducts = await Product.find({ userId }).select('_id');
+        const productIds = sellerProducts.map(p => p._id);
 
         if (productIds.length === 0) {
-            return c.json({ success: true, orders: [] });
+            return res.json({ success: true, orders: [] });
         }
 
-        const placeholders = productIds.map(() => '?').join(',');
-        const { results: orderItems } = await c.env.DB.prepare(
-            `SELECT oi.*, o.status, o.payment, o.created_at as order_date 
-             FROM order_items oi 
-             JOIN orders o ON oi.order_id = o.id 
-             WHERE oi.product_id IN (${placeholders})
-             ORDER BY o.created_at DESC`
-        ).bind(...productIds).all();
+        const prodIdSet = new Set(productIds.map(id => id.toString()));
+        const orders = await Order.find({ 'items.productId': { $in: productIds } }).sort({ createdAt: -1 });
 
-        const sellerOrders = orderItems.map(item => ({
-            orderId: item.order_id, productName: item.name,
-            productImage: JSON.parse(item.image || '[]')[0] || '',
-            size: item.size, quantity: item.quantity,
-            duration: item.duration || 1, orderDate: item.order_date,
-            status: item.status, payment: item.payment,
-            message: 'Please pack this item and mark as ready.'
-        }));
+        const sellerOrders = [];
 
-        return c.json({ success: true, orders: sellerOrders });
+        for (const order of orders) {
+            for (const item of order.items) {
+                if (item.productId && prodIdSet.has(item.productId.toString())) {
+                    sellerOrders.push({
+                        orderId: order._id.toString(),
+                        productName: item.name,
+                        productImage: (item.image && item.image[0]) || '',
+                        size: item.size,
+                        quantity: item.quantity,
+                        duration: item.duration || 1,
+                        orderDate: order.createdAt,
+                        status: order.status,
+                        payment: order.payment,
+                        message: 'Please pack this item and mark as ready.'
+                    });
+                }
+            }
+        }
+
+        return res.json({ success: true, orders: sellerOrders });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
-export default app;
+export default router;

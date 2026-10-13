@@ -1,30 +1,44 @@
-import { Hono } from 'hono';
+import express from 'express';
+import mongoose from 'mongoose';
+import User from '../models/User.js';
+import Product from '../models/Product.js';
 import { authUser, checkBanned, sanitizeError } from '../middleware/auth.js';
 
-const app = new Hono();
+const router = express.Router();
 
-// Add to cart
-app.post('/add', authUser, checkBanned, async (c) => {
+// ── Add to cart ────────────────────────────────────────────────────
+router.post('/add', authUser, checkBanned, async (req, res) => {
     try {
-        const userId = c.get('userId');
-        const { itemId, size } = await c.req.json();
+        const userId = req.userId;
+        const { itemId, size } = req.body;
+
+        if (!itemId || !size) {
+            return res.status(400).json({ success: false, message: 'Item ID and size are required.' });
+        }
 
         // Check if product exists and is available
-        const product = await c.env.DB.prepare('SELECT id, status, name FROM products WHERE id = ?').bind(itemId).first();
-        if (!product) {
-            return c.json({ success: false, message: 'Product not found.' }, 404);
+        if (!mongoose.Types.ObjectId.isValid(itemId)) {
+            return res.status(404).json({ success: false, message: 'Product not found.' });
+        }
+
+        const product = await Product.findById(itemId);
+        if (!product || !product.isActive) {
+            return res.status(404).json({ success: false, message: 'Product not found.' });
         }
 
         if (product.status !== 'available') {
-            return c.json({ success: false, message: `Sorry, "${product.name}" is currently unavailable for rent.` }, 400);
+            return res.status(400).json({
+                success: false,
+                message: `Sorry, "${product.name}" is currently unavailable for rent.`
+            });
         }
 
-        const user = await c.env.DB.prepare('SELECT cart_data FROM users WHERE id = ?').bind(userId).first();
+        const user = await User.findById(userId);
         if (!user) {
-            return c.json({ success: false, message: 'User not found.' }, 404);
+            return res.status(404).json({ success: false, message: 'User not found.' });
         }
 
-        let cartData = JSON.parse(user.cart_data || '{}');
+        const cartData = user.cartData || {};
 
         if (cartData[itemId]) {
             if (cartData[itemId][size]) {
@@ -36,57 +50,62 @@ app.post('/add', authUser, checkBanned, async (c) => {
             cartData[itemId] = { [size]: 1 };
         }
 
-        await c.env.DB.prepare('UPDATE users SET cart_data = ? WHERE id = ?')
-            .bind(JSON.stringify(cartData), userId).run();
+        user.cartData = cartData;
+        user.markModified('cartData');
+        await user.save();
 
-        return c.json({ success: true, message: 'Added To Cart' });
+        return res.json({ success: true, message: 'Added To Cart' });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
-// Update cart
-app.post('/update', authUser, checkBanned, async (c) => {
+// ── Update cart ───────────────────────────────────────────────────
+router.post('/update', authUser, checkBanned, async (req, res) => {
     try {
-        const userId = c.get('userId');
-        const { itemId, size, duration } = await c.req.json();
+        const userId = req.userId;
+        const { itemId, size, duration } = req.body;
 
-        const user = await c.env.DB.prepare('SELECT cart_data FROM users WHERE id = ?').bind(userId).first();
+        const user = await User.findById(userId);
         if (!user) {
-            return c.json({ success: false, message: 'User not found.' }, 404);
+            return res.status(404).json({ success: false, message: 'User not found.' });
         }
 
-        let cartData = JSON.parse(user.cart_data || '{}');
+        const cartData = user.cartData || {};
 
         if (cartData[itemId]) {
-            cartData[itemId][size] = duration;
+            if (Number(duration) <= 0) {
+                delete cartData[itemId][size];
+                if (Object.keys(cartData[itemId]).length === 0) {
+                    delete cartData[itemId];
+                }
+            } else {
+                cartData[itemId][size] = Number(duration);
+            }
         }
 
-        await c.env.DB.prepare('UPDATE users SET cart_data = ? WHERE id = ?')
-            .bind(JSON.stringify(cartData), userId).run();
+        user.cartData = cartData;
+        user.markModified('cartData');
+        await user.save();
 
-        return c.json({ success: true, message: 'Cart Updated' });
+        return res.json({ success: true, message: 'Cart Updated' });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
-// Get cart
-app.post('/get', authUser, async (c) => {
+// ── Get cart ──────────────────────────────────────────────────────
+router.post('/get', authUser, async (req, res) => {
     try {
-        const userId = c.get('userId');
-
-        const user = await c.env.DB.prepare('SELECT cart_data FROM users WHERE id = ?').bind(userId).first();
+        const user = await User.findById(req.userId).select('cartData');
         if (!user) {
-            return c.json({ success: false, message: 'User not found.' }, 404);
+            return res.status(404).json({ success: false, message: 'User not found.' });
         }
 
-        const cartData = JSON.parse(user.cart_data || '{}');
-
-        return c.json({ success: true, cartData });
+        return res.json({ success: true, cartData: user.cartData || {} });
     } catch (error) {
-        return c.json({ success: false, message: sanitizeError(error) }, 500);
+        return res.status(500).json({ success: false, message: sanitizeError(error) });
     }
 });
 
-export default app;
+export default router;

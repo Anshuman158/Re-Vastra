@@ -1,7 +1,9 @@
 node_modules
-
-*.env
+.env
+.env.local
+.env.production
 .vercel
-backEnd/.wrangler/
-frontEnd/.env
-admin/.env
+dist
+build
+uploads/
+.wrangler/
